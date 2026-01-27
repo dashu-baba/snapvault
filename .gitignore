@@ -16,3 +16,6 @@ Thumbs.db
 # Test repositories
 test-repo/
 *.test-repo/
+repo1/
+ouput/
+output/
