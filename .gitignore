@@ -1,1 +1,21 @@
-/Requirements.md
+# Rust build artifacts
+target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test repositories
+test-repo/
+*.test-repo/
+repo1/
+ouput/
+output/
