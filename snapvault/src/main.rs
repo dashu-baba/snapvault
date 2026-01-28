@@ -9,6 +9,11 @@ use std::time::SystemTime;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+// Constants for security limits
+const MAX_CONFIG_SIZE: u64 = 1024 * 1024; // 1MB
+const MAX_MANIFEST_SIZE: u64 = 100 * 1024 * 1024; // 100MB
+const SNAPSHOT_UUID_LEN: usize = 8;
+
 #[derive(Parser)]
 #[command(name = "snapvault")]
 #[command(version, about, long_about = None)]
@@ -98,11 +103,35 @@ struct FileRecord {
     modified: Option<String>,
 }
 
+/// Validate snapshot ID to prevent path traversal
+fn validate_snapshot_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        anyhow::bail!("Snapshot ID cannot be empty");
+    }
+    if id.contains('\0') {
+        anyhow::bail!("Snapshot ID contains null byte");
+    }
+    if id.contains('/') || id.contains('\\') {
+        anyhow::bail!("Snapshot ID cannot contain path separators");
+    }
+    if id.starts_with('.') {
+        anyhow::bail!("Snapshot ID cannot start with dot");
+    }
+    Ok(())
+}
+
+/// Check if a path is safe (no traversal, no absolute paths, no null bytes)
 fn is_safe_path(path_str: &str) -> bool {
+    // Check for null bytes (security: null byte injection)
+    if path_str.contains('\0') {
+        return false;
+    }
+    
     let path = Path::new(path_str);
     if path.is_absolute() {
         return false;
     }
+    
     for comp in path.components() {
         match comp {
             std::path::Component::Normal(_) => {},
@@ -166,6 +195,18 @@ fn load_repo_config(repo_path: &Path) -> Result<RepoConfig> {
             config_path.display()
         );
     }
+    
+    // Security: Check file size before reading
+    let metadata = fs::metadata(&config_path)
+        .context("Failed to read config metadata")?;
+    if metadata.len() > MAX_CONFIG_SIZE {
+        anyhow::bail!(
+            "Config file too large: {} bytes (max: {} bytes)",
+            metadata.len(),
+            MAX_CONFIG_SIZE
+        );
+    }
+    
     let raw = fs::read_to_string(&config_path).context("Failed to read repo config")?;
     let cfg: RepoConfig = serde_json::from_str(&raw).context("Invalid repo config JSON")?;
     if cfg.version != 1 {
@@ -193,7 +234,7 @@ fn backup_basic(source_path: &Path, repo_path: &Path) -> Result<()> {
     let snapshot_id = format!(
         "{}-{}",
         chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
-        &Uuid::new_v4().to_string()[..8]
+        &Uuid::new_v4().to_string()[..SNAPSHOT_UUID_LEN]
     );
     let data_root = repo_path.join("data").join(&snapshot_id);
     let snapshot_manifest_path = repo_path.join("snapshots").join(format!("{snapshot_id}.json"));
@@ -297,8 +338,10 @@ fn backup_basic(source_path: &Path, repo_path: &Path) -> Result<()> {
     let (total_files, total_bytes, files) = match backup_result {
         Ok(result) => result,
         Err(e) => {
-            warn!("Backup failed, cleaning up partial data");
-            let _ = fs::remove_dir_all(&data_root);
+            warn!("Backup failed, cleaning up partial data at {}", data_root.display());
+            if let Err(cleanup_err) = fs::remove_dir_all(&data_root) {
+                warn!("Failed to cleanup partial backup: {}", cleanup_err);
+            }
             return Err(e);
         }
     };
@@ -348,8 +391,17 @@ fn list_snapshots(repo_path: &Path) -> Result<()> {
         let entry = entry?;
         let path = entry.path();
         if path.extension() == Some(std::ffi::OsStr::new("json")) {
-            let raw = fs::read_to_string(&path)?;
-            let manifest: SnapshotManifest = serde_json::from_str(&raw)?;
+            // Security: Check manifest size before reading
+            let metadata = fs::metadata(&path)?;
+            if metadata.len() > MAX_MANIFEST_SIZE {
+                warn!("Skipping oversized manifest: {} ({} bytes)", path.display(), metadata.len());
+                continue;
+            }
+            
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read manifest: {}", path.display()))?;
+            let manifest: SnapshotManifest = serde_json::from_str(&raw)
+                .with_context(|| format!("Failed to parse manifest: {}", path.display()))?;
             snapshots.push(manifest);
         }
     }
@@ -381,10 +433,8 @@ fn list_snapshots(repo_path: &Path) -> Result<()> {
 }
 
 fn delete_single_snapshot(repo_path: &Path, snapshot_id: &str) -> Result<()> {
-    // Check for path traversal in snapshot_id
-    if snapshot_id.contains('/') || snapshot_id.contains('\\') || snapshot_id.starts_with('.') {
-        anyhow::bail!("Invalid snapshot ID: {}", snapshot_id);
-    }
+    // Security: Validate snapshot ID
+    validate_snapshot_id(snapshot_id)?;
 
     let manifest_path = repo_path.join("snapshots").join(format!("{}.json", snapshot_id));
     let data_path = repo_path.join("data").join(snapshot_id);
@@ -492,6 +542,9 @@ fn restore(snapshot_id_opt: Option<&str>, dest_path: &Path, repo_path: &Path) ->
 
     // Determine snapshot ID
     let snapshot_id = if let Some(id) = snapshot_id_opt {
+        // Security: Validate snapshot ID
+        validate_snapshot_id(id)?;
+        
         if !repo_path.join("snapshots").join(format!("{}.json", id)).exists() {
             anyhow::bail!("Snapshot {} not found", id);
         }
@@ -539,6 +592,18 @@ fn restore(snapshot_id_opt: Option<&str>, dest_path: &Path, repo_path: &Path) ->
     if !manifest_path.is_file() {
         anyhow::bail!("Snapshot manifest not found: {}", manifest_path.display());
     }
+    
+    // Security: Check manifest size before reading
+    let metadata = fs::metadata(&manifest_path)
+        .context("Failed to read manifest metadata")?;
+    if metadata.len() > MAX_MANIFEST_SIZE {
+        anyhow::bail!(
+            "Manifest file too large: {} bytes (max: {} bytes)",
+            metadata.len(),
+            MAX_MANIFEST_SIZE
+        );
+    }
+    
     let raw = fs::read_to_string(&manifest_path).context("Failed to read snapshot manifest")?;
     let manifest: SnapshotManifest = serde_json::from_str(&raw).context("Failed to parse snapshot manifest")?;
     if manifest.snapshot_id != snapshot_id {
@@ -553,7 +618,10 @@ fn restore(snapshot_id_opt: Option<&str>, dest_path: &Path, repo_path: &Path) ->
 
     // Restore files
     let mut restored_count = 0;
-    for file in &manifest.files {
+    let total_files = manifest.files.len();
+    
+    for (idx, file) in manifest.files.iter().enumerate() {
+        // Security: Validate path safety
         if !is_safe_path(&file.rel_path) {
             warn!("Skipping unsafe path: {}", file.rel_path);
             continue;
@@ -575,6 +643,11 @@ fn restore(snapshot_id_opt: Option<&str>, dest_path: &Path, repo_path: &Path) ->
         })?;
 
         restored_count += 1;
+        
+        // Log progress every 100 files
+        if restored_count % 100 == 0 {
+            info!("Restored {}/{} files", restored_count, total_files);
+        }
     }
 
     println!("✓ Restore complete");
