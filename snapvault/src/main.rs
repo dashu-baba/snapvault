@@ -22,12 +22,44 @@ enum Commands {
     /// Initialize a new backup repository
     Init {
         /// Path where the repository will be created
-        repo_path: PathBuf,
+        #[arg(long)]
+        repo: PathBuf,
     },
     /// Create a backup snapshot (basic: full copy + manifest)
     Backup {
         /// Source directory to backup
-        source_path: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+        /// Repository path
+        #[arg(long)]
+        repo: PathBuf,
+    },
+    /// List all snapshots in the repository
+    List {
+        /// Repository path
+        #[arg(long)]
+        repo: PathBuf,
+    },
+    /// Delete a snapshot or all snapshots from the repository
+    Delete {
+        /// Repository path
+        #[arg(long)]
+        repo: PathBuf,
+        /// Snapshot ID to delete
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Delete all snapshots
+        #[arg(long)]
+        all: bool,
+    },
+    /// Restore a snapshot to a directory
+    Restore {
+        /// Destination directory to restore to
+        #[arg(long)]
+        dest: PathBuf,
+        /// Snapshot ID to restore (latest if not provided)
+        #[arg(long)]
+        snapshot: Option<String>,
         /// Repository path
         #[arg(long)]
         repo: PathBuf,
@@ -66,13 +98,32 @@ struct FileRecord {
     modified: Option<String>,
 }
 
+fn is_safe_path(path_str: &str) -> bool {
+    let path = Path::new(path_str);
+    if path.is_absolute() {
+        return false;
+    }
+    for comp in path.components() {
+        match comp {
+            std::path::Component::Normal(_) => {},
+            std::path::Component::ParentDir => return false,
+            std::path::Component::CurDir => {}, // allow .
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { repo_path } => init_repository(&repo_path),
-        Commands::Backup { source_path, repo } => backup_basic(&source_path, &repo),
+        Commands::Init { repo } => init_repository(&repo),
+        Commands::Backup { source, repo } => backup_basic(&source, &repo),
+        Commands::List { repo } => list_snapshots(&repo),
+        Commands::Delete { repo, snapshot, all } => delete_snapshot(&repo, snapshot.as_deref(), all),
+        Commands::Restore { dest, snapshot, repo } => restore(snapshot.as_deref(), &dest, &repo),
     }
 }
 
@@ -273,6 +324,263 @@ fn backup_basic(source_path: &Path, repo_path: &Path) -> Result<()> {
     println!("  Bytes:      {}", total_bytes);
     println!("  Manifest:   {}", snapshot_manifest_path.display());
     println!("  Data root:  {}", data_root.display());
+
+    Ok(())
+}
+
+fn list_snapshots(repo_path: &Path) -> Result<()> {
+    info!("Listing snapshots in repository: {}", repo_path.display());
+
+    // Validate repo
+    if !repo_path.exists() {
+        anyhow::bail!("Repository path does not exist: {}", repo_path.display());
+    }
+    let _cfg = load_repo_config(repo_path)?;
+
+    let snapshots_dir = repo_path.join("snapshots");
+    if !snapshots_dir.exists() {
+        println!("No snapshots found in repository.");
+        return Ok(());
+    }
+
+    let mut snapshots: Vec<SnapshotManifest> = Vec::new();
+    for entry in fs::read_dir(&snapshots_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension() == Some(std::ffi::OsStr::new("json")) {
+            let raw = fs::read_to_string(&path)?;
+            let manifest: SnapshotManifest = serde_json::from_str(&raw)?;
+            snapshots.push(manifest);
+        }
+    }
+
+    if snapshots.is_empty() {
+        println!("No snapshots found in repository.");
+        return Ok(());
+    }
+
+    // Sort by created_at descending (latest first)
+    snapshots.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    println!("Snapshots in repository {}:", repo_path.display());
+    println!("{:<40} {:<25} {:<10} {:<10} {}", "Snapshot ID", "Created At", "Files", "Bytes", "Source Root");
+    println!("{}", "-".repeat(100));
+
+    for snap in snapshots {
+        println!(
+            "{:<40} {:<25} {:<10} {:<10} {}",
+            snap.snapshot_id,
+            snap.created_at,
+            snap.total_files,
+            snap.total_bytes,
+            snap.source_root
+        );
+    }
+
+    Ok(())
+}
+
+fn delete_single_snapshot(repo_path: &Path, snapshot_id: &str) -> Result<()> {
+    // Check for path traversal in snapshot_id
+    if snapshot_id.contains('/') || snapshot_id.contains('\\') || snapshot_id.starts_with('.') {
+        anyhow::bail!("Invalid snapshot ID: {}", snapshot_id);
+    }
+
+    let manifest_path = repo_path.join("snapshots").join(format!("{}.json", snapshot_id));
+    let data_path = repo_path.join("data").join(snapshot_id);
+
+    // Check if both manifest and data exist
+    if !manifest_path.exists() {
+        anyhow::bail!("Snapshot manifest not found: {}", manifest_path.display());
+    }
+    if !data_path.exists() {
+        anyhow::bail!("Snapshot data directory not found: {}", data_path.display());
+    }
+
+    // Load manifest to verify it's a valid snapshot
+    let raw = fs::read_to_string(&manifest_path)?;
+    let manifest: SnapshotManifest = serde_json::from_str(&raw)?;
+    if manifest.snapshot_id != snapshot_id {
+        anyhow::bail!("Manifest snapshot ID mismatch");
+    }
+
+    // Delete data directory first
+    info!("Removing snapshot data directory: {}", data_path.display());
+    fs::remove_dir_all(&data_path).with_context(|| {
+        format!("Failed to remove snapshot data directory: {}", data_path.display())
+    })?;
+
+    // Delete manifest file
+    info!("Removing snapshot manifest: {}", manifest_path.display());
+    fs::remove_file(&manifest_path).with_context(|| {
+        format!("Failed to remove snapshot manifest: {}", manifest_path.display())
+    })?;
+
+    Ok(())
+}
+
+fn delete_snapshot(repo_path: &Path, snapshot_id_opt: Option<&str>, all: bool) -> Result<()> {
+    // Validate arguments
+    match (snapshot_id_opt, all) {
+        (Some(_), true) => anyhow::bail!("Cannot specify both --snapshot and --all"),
+        (None, false) => anyhow::bail!("Must specify either --snapshot or --all"),
+        _ => {}
+    }
+
+    // Validate repo
+    if !repo_path.exists() {
+        anyhow::bail!("Repository path does not exist: {}", repo_path.display());
+    }
+    let _cfg = load_repo_config(repo_path)?;
+
+    if let Some(snapshot_id) = snapshot_id_opt {
+        info!("Deleting snapshot {} from repository {}", snapshot_id, repo_path.display());
+        delete_single_snapshot(repo_path, snapshot_id)?;
+        println!("✓ Snapshot {} deleted successfully", snapshot_id);
+    } else {
+        // all is true
+        info!("Deleting all snapshots from repository {}", repo_path.display());
+
+        let snapshots_dir = repo_path.join("snapshots");
+        if !snapshots_dir.exists() {
+            println!("No snapshots found in repository.");
+            return Ok(());
+        }
+
+        let mut snapshot_ids: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&snapshots_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension() == Some(std::ffi::OsStr::new("json")) {
+                if let Some(stem) = path.file_stem() {
+                    snapshot_ids.push(stem.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        if snapshot_ids.is_empty() {
+            println!("No snapshots found in repository.");
+            return Ok(());
+        }
+
+        let total_snapshots = snapshot_ids.len();
+        let mut deleted_count = 0;
+        for id in snapshot_ids {
+            match delete_single_snapshot(repo_path, &id) {
+                Ok(()) => {
+                    println!("✓ Snapshot {} deleted successfully", id);
+                    deleted_count += 1;
+                }
+                Err(e) => {
+                    warn!("Failed to delete snapshot {}: {}", id, e);
+                }
+            }
+        }
+
+        println!("✓ Deleted {} out of {} snapshots", deleted_count, total_snapshots);
+    }
+
+    Ok(())
+}
+
+fn restore(snapshot_id_opt: Option<&str>, dest_path: &Path, repo_path: &Path) -> Result<()> {
+    // Validate repo
+    if !repo_path.exists() {
+        anyhow::bail!("Repository path does not exist: {}", repo_path.display());
+    }
+    let _cfg = load_repo_config(repo_path)?;
+
+    // Determine snapshot ID
+    let snapshot_id = if let Some(id) = snapshot_id_opt {
+        if !repo_path.join("snapshots").join(format!("{}.json", id)).exists() {
+            anyhow::bail!("Snapshot {} not found", id);
+        }
+        id.to_string()
+    } else {
+        // Find latest snapshot
+        let snapshots_dir = repo_path.join("snapshots");
+        if !snapshots_dir.exists() {
+            anyhow::bail!("No snapshots found in repository");
+        }
+        let mut snapshots: Vec<String> = fs::read_dir(&snapshots_dir)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension() == Some(std::ffi::OsStr::new("json")) {
+                    Some(path.file_stem()?.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if snapshots.is_empty() {
+            anyhow::bail!("No snapshots found in repository");
+        }
+        snapshots.sort_by(|a, b| b.cmp(a)); // descending order, since newer snapshots have larger IDs
+        snapshots[0].clone()
+    };
+
+    info!("Restoring snapshot {} to {}", snapshot_id, dest_path.display());
+
+    // Validate dest
+    if dest_path.exists() {
+        if !dest_path.is_dir() {
+            anyhow::bail!("Destination path is not a directory: {}", dest_path.display());
+        }
+        if fs::read_dir(dest_path)?.next().is_some() {
+            anyhow::bail!("Destination directory is not empty: {}", dest_path.display());
+        }
+    } else {
+        fs::create_dir_all(dest_path).context("Failed to create destination directory")?;
+    }
+
+    // Load manifest
+    let manifest_path = repo_path.join("snapshots").join(format!("{}.json", snapshot_id));
+    if !manifest_path.is_file() {
+        anyhow::bail!("Snapshot manifest not found: {}", manifest_path.display());
+    }
+    let raw = fs::read_to_string(&manifest_path).context("Failed to read snapshot manifest")?;
+    let manifest: SnapshotManifest = serde_json::from_str(&raw).context("Failed to parse snapshot manifest")?;
+    if manifest.snapshot_id != snapshot_id {
+        anyhow::bail!("Manifest snapshot ID mismatch");
+    }
+
+    // Check data root exists
+    let data_root = repo_path.join("data").join(&snapshot_id);
+    if !data_root.exists() {
+        anyhow::bail!("Snapshot data directory not found: {}", data_root.display());
+    }
+
+    // Restore files
+    let mut restored_count = 0;
+    for file in &manifest.files {
+        if !is_safe_path(&file.rel_path) {
+            warn!("Skipping unsafe path: {}", file.rel_path);
+            continue;
+        }
+
+        let src_path = data_root.join(&file.rel_path);
+        let dst_path = dest_path.join(&file.rel_path);
+
+        // Create parent directories
+        if let Some(parent) = dst_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create parent directory for {}", dst_path.display())
+            })?;
+        }
+
+        // Copy file
+        fs::copy(&src_path, &dst_path).with_context(|| {
+            format!("Failed to copy {} to {}", src_path.display(), dst_path.display())
+        })?;
+
+        restored_count += 1;
+    }
+
+    println!("✓ Restore complete");
+    println!("  Snapshot:     {}", snapshot_id);
+    println!("  Files:        {}", restored_count);
+    println!("  Destination:  {}", dest_path.display());
 
     Ok(())
 }
