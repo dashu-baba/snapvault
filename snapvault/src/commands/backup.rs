@@ -1,10 +1,14 @@
+use crate::chunking::{hash_file, Chunker};
 use crate::error::{Result, SnapVaultError};
+use crate::index::ChunkIndex;
 use crate::repository::snapshot::{FileRecord, SnapshotManifest};
 use crate::repository::Repository;
+use crate::storage::ChunkStore;
 use crate::utils::SNAPSHOT_UUID_LEN;
 use log::{info, warn};
+use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::Read;
 use std::path::Path;
 use std::time::SystemTime;
 use uuid::Uuid;
@@ -23,72 +27,94 @@ pub fn backup(source_path: &Path, repo_path: &Path) -> Result<()> {
 
     let repo = Repository::open(repo_path)?;
 
+    // Initialize chunk storage
+    let chunk_store = ChunkStore::new(repo.chunks_dir());
+    chunk_store.init()?;
+
+    // Load chunk index
+    let mut index = ChunkIndex::load(repo.index_path())?;
+
     let snapshot_id = format!(
         "{}-{}",
         chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
         &Uuid::new_v4().to_string()[..SNAPSHOT_UUID_LEN]
     );
-    let data_root = repo.data_dir().join(&snapshot_id);
-    let snapshot_manifest_path = repo
-        .snapshots_dir()
-        .join(format!("{snapshot_id}.json"));
-
-    fs::create_dir_all(&data_root)?;
 
     info!(
-        "Starting basic backup: source={}, repo={}, snapshot_id={}",
+        "Starting chunked backup: source={}, repo={}, snapshot_id={}",
         source_path.display(),
         repo_path.display(),
         snapshot_id
     );
 
-    let backup_result = perform_backup(source_path, &data_root);
+    let backup_result = perform_chunked_backup(source_path, &chunk_store);
 
-    let (total_files, total_bytes, files) = match backup_result {
+    let (mut manifest, stats) = match backup_result {
         Ok(result) => result,
         Err(e) => {
-            warn!(
-                "Backup failed, cleaning up partial data at {}",
-                data_root.display()
-            );
-            if let Err(cleanup_err) = fs::remove_dir_all(&data_root) {
-                warn!("Failed to cleanup partial backup: {}", cleanup_err);
-            }
+            warn!("Backup failed: {}", e);
             return Err(e);
         }
     };
 
-    let manifest = SnapshotManifest {
-        snapshot_id: snapshot_id.clone(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        source_root: source_path.to_string_lossy().to_string(),
-        total_files,
-        total_bytes,
-        files,
-    };
+    // Set snapshot metadata
+    manifest.snapshot_id = snapshot_id.clone();
+    manifest.created_at = chrono::Utc::now().to_rfc3339();
+    manifest.source_root = source_path.to_string_lossy().to_string();
 
+    // Update chunk index
+    index.add_snapshot(&manifest);
+    index.save(repo.index_path())?;
+
+    // Save manifest
+    let snapshot_manifest_path = repo
+        .snapshots_dir()
+        .join(format!("{}.json", snapshot_id));
     fs::write(
         &snapshot_manifest_path,
         serde_json::to_string_pretty(&manifest)?,
     )?;
 
+    // Print summary
     println!("✓ Backup complete");
-    println!("  Snapshot:   {}", snapshot_id);
-    println!("  Files:      {}", total_files);
-    println!("  Bytes:      {}", total_bytes);
-    println!("  Manifest:   {}", snapshot_manifest_path.display());
-    println!("  Data root:  {}", data_root.display());
+    println!("  Snapshot:         {}", snapshot_id);
+    println!("  Files:            {}", manifest.total_files);
+    println!("  Total size:       {} ({} bytes)", 
+        format_size(manifest.total_bytes), manifest.total_bytes);
+    println!("  Unique chunks:    {}", manifest.total_chunks);
+    println!("  Stored size:      {} ({} bytes)", 
+        format_size(manifest.deduplicated_bytes), manifest.deduplicated_bytes);
+    if let Some(ratio) = manifest.dedup_ratio() {
+        let saved = manifest.space_saved();
+        println!("  Space saved:      {} ({:.1}% dedup)", 
+            format_size(saved), 100.0 - ratio);
+    }
+    println!("  New chunks:       {}", stats.new_chunks);
+    println!("  Reused chunks:    {}", stats.reused_chunks);
+    println!("  Manifest:         {}", snapshot_manifest_path.display());
 
     Ok(())
 }
 
-fn perform_backup(
+/// Statistics about a backup operation
+struct BackupStats {
+    new_chunks: usize,
+    reused_chunks: usize,
+}
+
+fn perform_chunked_backup(
     source_path: &Path,
-    data_root: &Path,
-) -> Result<(u64, u64, Vec<FileRecord>)> {
-    let mut files: Vec<FileRecord> = Vec::new();
-    let mut total_files: u64 = 0;
-    let mut total_bytes: u64 = 0;
+    chunk_store: &ChunkStore,
+) -> Result<(SnapshotManifest, BackupStats)> {
+    let mut manifest = SnapshotManifest::new(String::new(), String::new());
+    let mut stats = BackupStats {
+        new_chunks: 0,
+        reused_chunks: 0,
+    };
+    
+    // Track unique chunks in this snapshot for dedup calculation
+    let mut unique_chunks = HashSet::new();
+    let chunker = Chunker::new();
 
     for entry in WalkDir::new(source_path).follow_links(false) {
         let entry = match entry {
@@ -121,6 +147,7 @@ fn perform_backup(
             }
         };
 
+        let file_size = md.len();
         let modified = md
             .modified()
             .ok()
@@ -141,35 +168,104 @@ fn perform_backup(
             .collect::<Vec<_>>()
             .join("/");
 
-        let dest_path = data_root.join(rel);
+        // Chunk the file
+        let chunks = match chunker.chunk_file(path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to chunk file {}: {}", path.display(), e);
+                continue;
+            }
+        };
 
-        // Ensure parent directories exist
-        if let Some(parent) = dest_path.parent() {
-            fs::create_dir_all(parent)?;
+        // Store chunks with deduplication
+        for chunk in &chunks {
+            let newly_stored = chunk_store.store(&chunk.hash, &read_chunk(path, chunk.offset, chunk.size)?)?;
+            
+            if newly_stored {
+                stats.new_chunks += 1;
+            } else {
+                stats.reused_chunks += 1;
+            }
+
+            unique_chunks.insert(chunk.hash.clone());
         }
 
-        let bytes_copied = copy_file(path, &dest_path)?;
+        // Compute file content hash
+        let content_hash = match hash_file(path) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!("Failed to hash file {}: {}", path.display(), e);
+                None
+            }
+        };
 
-        total_files += 1;
-        total_bytes = total_bytes.saturating_add(bytes_copied);
-
-        files.push(FileRecord {
-            rel_path: rel_str,
-            size: bytes_copied,
+        // Create file record
+        let file_record = FileRecord::new(
+            rel_str,
+            file_size,
             modified,
-        });
+            chunks.iter().map(|c| c.hash.clone()).collect(),
+            content_hash,
+        );
+
+        manifest.files.push(file_record);
+        manifest.total_files += 1;
+        manifest.total_bytes += file_size;
     }
 
-    Ok((total_files, total_bytes, files))
+    // Calculate deduplicated size
+    manifest.total_chunks = unique_chunks.len() as u64;
+    for chunk_hash in &unique_chunks {
+        if let Ok(size) = chunk_store.chunk_size(chunk_hash) {
+            manifest.deduplicated_bytes += size;
+        }
+    }
+
+    info!(
+        "Backup scan complete: {} files, {} bytes, {} unique chunks ({} new, {} reused)",
+        manifest.total_files,
+        manifest.total_bytes,
+        manifest.total_chunks,
+        stats.new_chunks,
+        stats.reused_chunks
+    );
+
+    Ok((manifest, stats))
 }
 
-fn copy_file(src: &Path, dst: &Path) -> io::Result<u64> {
-    fs::copy(src, dst)
+/// Read a specific chunk from a file
+fn read_chunk(path: &Path, offset: u64, size: usize) -> Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    let mut buffer = vec![0u8; size];
+    
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    file.read_exact(&mut buffer)?;
+    
+    Ok(buffer)
 }
 
 fn systemtime_to_rfc3339(t: SystemTime) -> Result<String> {
     let dt: chrono::DateTime<chrono::Utc> = t.into();
     Ok(dt.to_rfc3339())
+}
+
+/// Format a size in bytes to human-readable format
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit_idx = 0;
+
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+
+    if unit_idx == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{:.2} {}", size, UNITS[unit_idx])
+    }
 }
 
 #[cfg(test)]

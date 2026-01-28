@@ -55,6 +55,7 @@ impl Repository {
 
         fs::create_dir_all(path.join("snapshots"))?;
         fs::create_dir_all(path.join("data"))?;
+        fs::create_dir_all(path.join("data").join("chunks"))?;
 
         let config = RepoConfig::new();
         let cfg_path = path.join("config.json");
@@ -110,6 +111,16 @@ impl Repository {
     /// Get the data directory path
     pub fn data_dir(&self) -> PathBuf {
         self.root.join("data")
+    }
+
+    /// Get the chunks directory path (for content-addressed storage)
+    pub fn chunks_dir(&self) -> PathBuf {
+        self.data_dir().join("chunks")
+    }
+
+    /// Get the chunk index file path
+    pub fn index_path(&self) -> PathBuf {
+        self.root.join("index.json")
     }
 
     /// Get repository configuration

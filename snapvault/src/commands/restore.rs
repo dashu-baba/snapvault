@@ -1,9 +1,11 @@
 use crate::error::{Result, SnapVaultError};
 use crate::repository::snapshot::SnapshotManifest;
 use crate::repository::Repository;
+use crate::storage::ChunkStore;
 use crate::utils::{is_safe_path, validate_snapshot_id, MAX_MANIFEST_SIZE};
 use log::{info, warn};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 pub fn restore(snapshot_id_opt: Option<&str>, dest_path: &Path, repo_path: &Path) -> Result<()> {
@@ -94,13 +96,10 @@ pub fn restore(snapshot_id_opt: Option<&str>, dest_path: &Path, repo_path: &Path
         ));
     }
 
-    // Check data root exists
-    let data_root = repo.data_dir().join(&snapshot_id);
-    if !data_root.exists() {
-        return Err(SnapVaultError::SnapshotNotFound(snapshot_id.clone()));
-    }
+    // Initialize chunk storage
+    let chunk_store = ChunkStore::new(repo.chunks_dir());
 
-    // Restore files
+    // Restore files by reassembling chunks
     let mut restored_count = 0;
     let total_files = manifest.files.len();
 
@@ -111,7 +110,6 @@ pub fn restore(snapshot_id_opt: Option<&str>, dest_path: &Path, repo_path: &Path
             continue;
         }
 
-        let src_path = data_root.join(&file.rel_path);
         let dst_path = dest_path.join(&file.rel_path);
 
         // Create parent directories
@@ -119,8 +117,19 @@ pub fn restore(snapshot_id_opt: Option<&str>, dest_path: &Path, repo_path: &Path
             fs::create_dir_all(parent)?;
         }
 
-        // Copy file
-        fs::copy(&src_path, &dst_path)?;
+        // Reassemble file from chunks
+        let mut output_file = fs::File::create(&dst_path)?;
+        
+        for chunk_hash in &file.chunks {
+            // Read chunk from storage
+            let chunk_data = chunk_store.read(chunk_hash)?;
+            
+            // Write chunk to output file
+            output_file.write_all(&chunk_data)?;
+        }
+        
+        // Ensure all data is written to disk
+        output_file.sync_all()?;
 
         restored_count += 1;
 

@@ -1,6 +1,8 @@
 use crate::error::{Result, SnapVaultError};
+use crate::index::ChunkIndex;
 use crate::repository::snapshot::SnapshotManifest;
 use crate::repository::Repository;
+use crate::storage::ChunkStore;
 use crate::utils::validate_snapshot_id;
 use log::{info, warn};
 use std::fs;
@@ -80,13 +82,9 @@ fn delete_single_snapshot(repo: &Repository, snapshot_id: &str) -> Result<()> {
     let manifest_path = repo
         .snapshots_dir()
         .join(format!("{}.json", snapshot_id));
-    let data_path = repo.data_dir().join(snapshot_id);
 
-    // Check if both manifest and data exist
+    // Check if manifest exists
     if !manifest_path.exists() {
-        return Err(SnapVaultError::SnapshotNotFound(snapshot_id.to_string()));
-    }
-    if !data_path.exists() {
         return Err(SnapVaultError::SnapshotNotFound(snapshot_id.to_string()));
     }
 
@@ -99,9 +97,36 @@ fn delete_single_snapshot(repo: &Repository, snapshot_id: &str) -> Result<()> {
         ));
     }
 
-    // Delete data directory first
-    info!("Removing snapshot data directory: {}", data_path.display());
-    fs::remove_dir_all(&data_path)?;
+    // Load chunk index
+    let mut index = ChunkIndex::load(repo.index_path())?;
+    
+    // Initialize chunk storage
+    let chunk_store = ChunkStore::new(repo.chunks_dir());
+
+    // Remove snapshot from index and get orphaned chunks
+    info!("Removing snapshot {} from chunk index", snapshot_id);
+    let orphaned_chunks = index.remove_snapshot(&manifest);
+
+    // Delete orphaned chunks from storage
+    let mut deleted_chunks = 0;
+    for chunk_hash in &orphaned_chunks {
+        match chunk_store.delete(chunk_hash) {
+            Ok(()) => deleted_chunks += 1,
+            Err(e) => {
+                warn!("Failed to delete chunk {}: {}", chunk_hash, e);
+            }
+        }
+    }
+
+    if !orphaned_chunks.is_empty() {
+        info!(
+            "Deleted {} orphaned chunks (no longer referenced by any snapshot)",
+            deleted_chunks
+        );
+    }
+
+    // Save updated index
+    index.save(repo.index_path())?;
 
     // Delete manifest file
     info!("Removing snapshot manifest: {}", manifest_path.display());

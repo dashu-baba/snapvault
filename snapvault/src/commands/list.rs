@@ -6,6 +6,24 @@ use log::{info, warn};
 use std::fs;
 use std::path::Path;
 
+/// Format a size in bytes to human-readable format
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit_idx = 0;
+
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+
+    if unit_idx == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{:.1} {}", size, UNITS[unit_idx])
+    }
+}
+
 pub fn list(repo_path: &Path) -> Result<()> {
     info!("Listing snapshots in repository: {}", repo_path.display());
 
@@ -61,18 +79,21 @@ pub fn list(repo_path: &Path) -> Result<()> {
 
     println!("Snapshots in repository {}:", repo_path.display());
     println!(
-        "{:<40} {:<25} {:<10} {:<10} {}",
-        "Snapshot ID", "Created At", "Files", "Bytes", "Source Root"
+        "{:<40} {:<25} {:<6} {:<12} {:<12} {:<8} {}",
+        "Snapshot ID", "Created At", "Files", "Size", "Stored", "Dedup%", "Source"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(120));
 
     for snap in snapshots {
+        let dedup_pct = snap.dedup_ratio().map(|r| format!("{:.1}%", 100.0 - r)).unwrap_or_else(|| "N/A".to_string());
         println!(
-            "{:<40} {:<25} {:<10} {:<10} {}",
+            "{:<40} {:<25} {:<6} {:<12} {:<12} {:<8} {}",
             snap.snapshot_id,
             snap.created_at,
             snap.total_files,
-            snap.total_bytes,
+            format_size(snap.total_bytes),
+            format_size(snap.deduplicated_bytes),
+            dedup_pct,
             snap.source_root
         );
     }
