@@ -4,13 +4,13 @@
 //! enabling safe chunk deletion and providing deduplication statistics.
 
 use crate::chunking::ChunkHash;
-use crate::error::{Result, SnapVaultError};
+use crate::error::Result;
 use crate::repository::snapshot::SnapshotManifest;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Chunk reference index
 /// Maps chunk hashes to the set of snapshot IDs that reference them
@@ -30,7 +30,7 @@ mod chunk_refs_serde {
     pub fn serialize<S>(
         map: &HashMap<ChunkHash, HashSet<String>>,
         serializer: S,
-    ) -> Result<S::Ok, S::Error>
+    ) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -48,7 +48,7 @@ mod chunk_refs_serde {
 
     pub fn deserialize<'de, D>(
         deserializer: D,
-    ) -> Result<HashMap<ChunkHash, HashSet<String>>, D::Error>
+    ) -> std::result::Result<HashMap<ChunkHash, HashSet<String>>, D::Error>
     where
         D: Deserializer<'de>,
     {

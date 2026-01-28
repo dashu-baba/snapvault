@@ -3,7 +3,7 @@
 //! This module handles the physical storage of chunks on disk using content addressing.
 //! Chunks are stored in a two-level directory structure based on their hash prefix.
 
-use crate::chunking::{Chunk, ChunkHash};
+use crate::chunking::ChunkHash;
 use crate::error::{Result, SnapVaultError};
 use log::{debug, warn};
 use std::fs;
