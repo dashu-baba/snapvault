@@ -104,7 +104,7 @@ pub fn restore(snapshot_id_opt: Option<&str>, dest_path: &Path, repo_path: &Path
     let mut restored_count = 0;
     let total_files = manifest.files.len();
 
-    for (idx, file) in manifest.files.iter().enumerate() {
+    for file in manifest.files.iter() {
         // Security: Validate path safety
         if !is_safe_path(&file.rel_path) {
             warn!("Skipping unsafe path: {}", file.rel_path);

@@ -41,11 +41,11 @@ pub fn list(repo_path: &Path) -> Result<()> {
             })?;
             
             let manifest: SnapshotManifest = serde_json::from_str(&raw).map_err(|e| {
-                SnapVaultError::Json(serde_json::Error::custom(format!(
+                SnapVaultError::Other(format!(
                     "Failed to parse manifest {}: {}",
                     path.display(),
                     e
-                )))
+                ))
             })?;
             snapshots.push(manifest);
         }
